@@ -23,14 +23,27 @@ func BoolValueOrDefault(r *http.Request, k string, d bool) bool {
 	return BoolValue(r, k)
 }
 
-// Int64ValueOrZero parses a form value into a int64 type.
+// Int64ValueOrZero parses a form value into an int64 type.
 // It returns 0 if the parsing fails.
 func Int64ValueOrZero(r *http.Request, k string) int64 {
-	val, err := strconv.ParseInt(r.FormValue(k), 10, 64)
+	val, err := Int64ValueOrDefault(r, k, 0)
 	if err != nil {
 		return 0
 	}
 	return val
+}
+
+// Int64ValueOrDefault parses a form value into an int64 type. If there is an
+// error, returns the error. If there is no value returns the default value.
+func Int64ValueOrDefault(r *http.Request, field string, def int64) (int64, error) {
+	if r.Form.Get(field) != "" {
+		value, err := strconv.ParseInt(r.Form.Get(field), 10, 64)
+		if err != nil {
+			return value, err
+		}
+		return value, nil
+	}
+	return def, nil
 }
 
 // ArchiveOptions stores archive information for different operations.
@@ -42,9 +55,6 @@ type ArchiveOptions struct {
 // ArchiveFormValues parses form values and turns them into ArchiveOptions.
 // It fails if the archive name and path are not in the request.
 func ArchiveFormValues(r *http.Request, vars map[string]string) (ArchiveOptions, error) {
-	if vars == nil {
-		return ArchiveOptions{}, fmt.Errorf("Missing parameter")
-	}
 	if err := ParseForm(r); err != nil {
 		return ArchiveOptions{}, err
 	}

@@ -2,23 +2,21 @@ package server
 
 import (
 	"crypto/tls"
-	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/server/httputils"
+	"github.com/docker/docker/api/server/middleware"
 	"github.com/docker/docker/api/server/router"
-	"github.com/docker/docker/api/server/router/local"
-	"github.com/docker/docker/api/server/router/network"
-	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/pkg/sockets"
-	"github.com/docker/docker/utils"
 	"github.com/gorilla/mux"
 	"golang.org/x/net/context"
 )
+
+// versionMatcher defines a variable matcher to be parsed by the router
+// when a request is about to be served.
+const versionMatcher = "/v{version:[0-9.]+}"
 
 // Config provides the configuration for the API server
 type Config struct {
@@ -32,17 +30,37 @@ type Config struct {
 
 // Server contains instance details for the server
 type Server struct {
-	cfg     *Config
-	start   chan struct{}
-	servers []serverCloser
-	routers []router.Router
+	cfg           *Config
+	servers       []*HTTPServer
+	routers       []router.Router
+	routerSwapper *routerSwapper
+	middlewares   []middleware.Middleware
 }
 
 // New returns a new instance of the server based on the specified configuration.
+// It allocates resources which will be needed for ServeAPI(ports, unix-sockets).
 func New(cfg *Config) *Server {
 	return &Server{
-		cfg:   cfg,
-		start: make(chan struct{}),
+		cfg: cfg,
+	}
+}
+
+// UseMiddleware appends a new middleware to the request chain.
+// This needs to be called before the API routes are configured.
+func (s *Server) UseMiddleware(m middleware.Middleware) {
+	s.middlewares = append(s.middlewares, m)
+}
+
+// Accept sets a listener the server accepts connections into.
+func (s *Server) Accept(addr string, listeners ...net.Listener) {
+	for _, listener := range listeners {
+		httpServer := &HTTPServer{
+			srv: &http.Server{
+				Addr: addr,
+			},
+			l: listener,
+		}
+		s.servers = append(s.servers, httpServer)
 	}
 }
 
@@ -55,39 +73,23 @@ func (s *Server) Close() {
 	}
 }
 
-type serverCloser interface {
-	Serve() error
-	Close() error
-}
-
-// ServeAPI loops through all of the protocols sent in to docker and spawns
-// off a go routine to setup a serving http.Server for each.
-func (s *Server) ServeAPI(protoAddrs []string) error {
-	var chErrors = make(chan error, len(protoAddrs))
-
-	for _, protoAddr := range protoAddrs {
-		protoAddrParts := strings.SplitN(protoAddr, "://", 2)
-		if len(protoAddrParts) != 2 {
-			return fmt.Errorf("bad format, expected PROTO://ADDR")
-		}
-		srv, err := s.newServer(protoAddrParts[0], protoAddrParts[1])
-		if err != nil {
-			return err
-		}
-		s.servers = append(s.servers, srv...)
-
-		for _, s := range srv {
-			logrus.Infof("Listening for HTTP on %s (%s)", protoAddrParts[0], protoAddrParts[1])
-			go func(s serverCloser) {
-				if err := s.Serve(); err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-					err = nil
-				}
-				chErrors <- err
-			}(s)
-		}
+// serveAPI loops through all initialized servers and spawns goroutine
+// with Server method for each. It sets createMux() as Handler also.
+func (s *Server) serveAPI() error {
+	var chErrors = make(chan error, len(s.servers))
+	for _, srv := range s.servers {
+		srv.srv.Handler = s.routerSwapper
+		go func(srv *HTTPServer) {
+			var err error
+			logrus.Infof("API listen on %s", srv.l.Addr())
+			if err = srv.Serve(); err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+				err = nil
+			}
+			chErrors <- err
+		}(srv)
 	}
 
-	for i := 0; i < len(protoAddrs); i++ {
+	for i := 0; i < len(s.servers); i++ {
 		err := <-chErrors
 		if err != nil {
 			return err
@@ -115,31 +117,8 @@ func (s *HTTPServer) Close() error {
 	return s.l.Close()
 }
 
-func writeCorsHeaders(w http.ResponseWriter, r *http.Request, corsHeaders string) {
-	logrus.Debugf("CORS header is enabled and set to: %s", corsHeaders)
-	w.Header().Add("Access-Control-Allow-Origin", corsHeaders)
-	w.Header().Add("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, X-Registry-Auth")
-	w.Header().Add("Access-Control-Allow-Methods", "HEAD, GET, POST, DELETE, PUT, OPTIONS")
-}
-
-func (s *Server) initTCPSocket(addr string) (l net.Listener, err error) {
-	if s.cfg.TLSConfig == nil || s.cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert {
-		logrus.Warn("/!\\ DON'T BIND ON ANY IP ADDRESS WITHOUT setting -tlsverify IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
-	}
-	if l, err = sockets.NewTCPSocket(addr, s.cfg.TLSConfig, s.start); err != nil {
-		return nil, err
-	}
-	if err := allocateDaemonPort(addr); err != nil {
-		return nil, err
-	}
-	return
-}
-
 func (s *Server) makeHTTPHandler(handler httputils.APIFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// log the handler call
-		logrus.Debugf("Calling %s %s", r.Method, r.URL.Path)
-
 		// Define the context that we'll pass around to share info
 		// like the docker-request-id.
 		//
@@ -150,51 +129,72 @@ func (s *Server) makeHTTPHandler(handler httputils.APIFunc) http.HandlerFunc {
 		ctx := context.Background()
 		handlerFunc := s.handleWithGlobalMiddlewares(handler)
 
-		if err := handlerFunc(ctx, w, r, mux.Vars(r)); err != nil {
-			logrus.Errorf("Handler for %s %s returned error: %s", r.Method, r.URL.Path, utils.GetErrorMessage(err))
+		vars := mux.Vars(r)
+		if vars == nil {
+			vars = make(map[string]string)
+		}
+
+		if err := handlerFunc(ctx, w, r, vars); err != nil {
+			logrus.Errorf("Handler for %s %s returned error: %v", r.Method, r.URL.Path, err)
 			httputils.WriteError(w, err)
 		}
 	}
 }
 
-// InitRouters initializes a list of routers for the server.
-func (s *Server) InitRouters(d *daemon.Daemon) {
-	s.addRouter(local.NewRouter(d))
-	s.addRouter(network.NewRouter(d))
-}
-
-// addRouter adds a new router to the server.
-func (s *Server) addRouter(r router.Router) {
-	s.routers = append(s.routers, r)
-}
-
-// CreateMux initializes the main router the server uses.
-// we keep enableCors just for legacy usage, need to be removed in the future
-func (s *Server) CreateMux() *mux.Router {
-	m := mux.NewRouter()
-	if os.Getenv("DEBUG") != "" {
-		profilerSetup(m, "/debug/")
+// InitRouter initializes the list of routers for the server.
+// This method also enables the Go profiler if enableProfiler is true.
+func (s *Server) InitRouter(enableProfiler bool, routers ...router.Router) {
+	for _, r := range routers {
+		s.routers = append(s.routers, r)
 	}
 
+	m := s.createMux()
+	if enableProfiler {
+		profilerSetup(m)
+	}
+	s.routerSwapper = &routerSwapper{
+		router: m,
+	}
+}
+
+// createMux initializes the main router the server uses.
+func (s *Server) createMux() *mux.Router {
+	m := mux.NewRouter()
+
 	logrus.Debugf("Registering routers")
-	for _, router := range s.routers {
-		for _, r := range router.Routes() {
+	for _, apiRouter := range s.routers {
+		for _, r := range apiRouter.Routes() {
 			f := s.makeHTTPHandler(r.Handler())
-			r.Register(m, f)
+
+			logrus.Debugf("Registering %s, %s", r.Method(), r.Path())
+			m.Path(versionMatcher + r.Path()).Methods(r.Method()).Handler(f)
+			m.Path(r.Path()).Methods(r.Method()).Handler(f)
 		}
 	}
 
 	return m
 }
 
-// AcceptConnections allows clients to connect to the API server.
-// Referenced Daemon is notified about this server, and waits for the
-// daemon acknowledgement before the incoming connections are accepted.
-func (s *Server) AcceptConnections() {
-	// close the lock so the listeners start accepting connections
-	select {
-	case <-s.start:
-	default:
-		close(s.start)
+// Wait blocks the server goroutine until it exits.
+// It sends an error message if there is any error during
+// the API execution.
+func (s *Server) Wait(waitChan chan error) {
+	if err := s.serveAPI(); err != nil {
+		logrus.Errorf("ServeAPI error: %v", err)
+		waitChan <- err
+		return
 	}
+	waitChan <- nil
+}
+
+// DisableProfiler reloads the server mux without adding the profiler routes.
+func (s *Server) DisableProfiler() {
+	s.routerSwapper.Swap(s.createMux())
+}
+
+// EnableProfiler reloads the server mux adding the profiler routes.
+func (s *Server) EnableProfiler() {
+	m := s.createMux()
+	profilerSetup(m)
+	s.routerSwapper.Swap(m)
 }

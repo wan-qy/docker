@@ -4,7 +4,7 @@ package configs
 
 import "fmt"
 
-// Gets the root uid for the process on host which could be non-zero
+// HostUID gets the root uid for the process on host which could be non-zero
 // when user namespaces are enabled.
 func (c Config) HostUID() (int, error) {
 	if c.Namespaces.Contains(NEWUSER) {
@@ -21,7 +21,7 @@ func (c Config) HostUID() (int, error) {
 	return 0, nil
 }
 
-// Gets the root uid for the process on host which could be non-zero
+// HostGID gets the root gid for the process on host which could be non-zero
 // when user namespaces are enabled.
 func (c Config) HostGID() (int, error) {
 	if c.Namespaces.Contains(NEWUSER) {
@@ -30,11 +30,11 @@ func (c Config) HostGID() (int, error) {
 		}
 		id, found := c.hostIDFromMapping(0, c.GidMappings)
 		if !found {
-			return -1, fmt.Errorf("User namespaces enabled, but no root user mapping found.")
+			return -1, fmt.Errorf("User namespaces enabled, but no root group mapping found.")
 		}
 		return id, nil
 	}
-	// Return default root uid 0
+	// Return default root gid 0
 	return 0, nil
 }
 

@@ -1,26 +1,37 @@
 package network
 
-import (
-	"github.com/docker/docker/api/server/httputils"
-	"github.com/docker/docker/api/server/router"
-)
+import "github.com/docker/docker/api/server/router"
 
 // networkRouter is a router to talk with the network controller
 type networkRouter struct {
-	routes []router.Route
+	backend Backend
+	routes  []router.Route
+}
+
+// NewRouter initializes a new network router
+func NewRouter(b Backend) router.Router {
+	r := &networkRouter{
+		backend: b,
+	}
+	r.initRoutes()
+	return r
 }
 
 // Routes returns the available routes to the network controller
-func (n networkRouter) Routes() []router.Route {
-	return n.routes
+func (r *networkRouter) Routes() []router.Route {
+	return r.routes
 }
 
-type networkRoute struct {
-	path    string
-	handler httputils.APIFunc
-}
-
-// Handler returns the APIFunc to let the server wrap it in middlewares
-func (l networkRoute) Handler() httputils.APIFunc {
-	return l.handler
+func (r *networkRouter) initRoutes() {
+	r.routes = []router.Route{
+		// GET
+		router.NewGetRoute("/networks", r.getNetworksList),
+		router.NewGetRoute("/networks/{id:.*}", r.getNetwork),
+		// POST
+		router.NewPostRoute("/networks/create", r.postNetworkCreate),
+		router.NewPostRoute("/networks/{id:.*}/connect", r.postNetworkConnect),
+		router.NewPostRoute("/networks/{id:.*}/disconnect", r.postNetworkDisconnect),
+		// DELETE
+		router.NewDeleteRoute("/networks/{id:.*}", r.deleteNetwork),
+	}
 }
